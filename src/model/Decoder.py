@@ -1,34 +1,75 @@
-import os
 import torch
 from torch import nn
-from torchvision.datasets import MNIST
-from torch.utils.data import DataLoader
-from torchvision import transforms
 import pytorch_lightning as pl
-from torch.nn import functional as f
-from utils.Helper import *
+from torch import Tensor
 from model.DecoderLayer import DecoderLayer
 
 class Decoder(pl.LightningModule):
+    """
+    Decoder module of the Transformer architecture as described in 'Attention is All You Need' (Vaswani et al., 2017).
+    
+    The Decoder consists of a stack of identical layers, each containing:
+    1. Masked multi-head self-attention mechanism
+    2. Multi-head cross-attention mechanism to encoder outputs
+    3. Position-wise feed-forward network
+    
+    The decoder takes the target sequence (shifted right) and the encoder output as input
+    and generates predictions for the next tokens in the sequence.
+    """
     def __init__(
         self, 
         num_layers: int = 6,
         dim_embedding: int = 512,
         num_heads: int = 8,
         dim_feedfordward: int = 2048,
-        dropout: int = 0.1
+        dropout: int = 0.1,
+        vocab_size: int = None  # Vocabulary size for output projection
     ):
+        """
+        Initialize a Decoder instance.
+        
+        Args:
+            num_layers: Number of decoder layers (default: 6)
+            dim_embedding: Dimension of the input embeddings (default: 512)
+            num_heads: Number of attention heads (default: 8)
+            dim_feedfordward: Dimension of the feedforward network (default: 2048)
+            dropout: Dropout rate (default: 0.1)
+            vocab_size: Size of the vocabulary for output projection (default: None)
+                        If None, uses dim_embedding as the output dimension
+        """
         super().__init__()
+        
+        # Stack of identical decoder layers
         self.layers = nn.ModuleList([ 
             DecoderLayer(dim_embedding, num_heads, dim_feedfordward, dropout) for _ in range(num_layers)
         ])
-        self.linear = nn.Linear(dim_embedding, dim_embedding)
+        
+        # Final linear projection to vocabulary size (or embedding dimension if vocab_size is None)
+        self.output_dim = vocab_size if vocab_size is not None else dim_embedding
+        self.linear = nn.Linear(dim_embedding, self.output_dim)
     
 
-    def forward(self, tgt:Tensor, memory:Tensor) -> Tensor:
-        _, seq_len, dim_embedding = tgt.size()
-        tgt += positional_encoding(seq_len, dim_embedding)
-        for layer in self.layers:
-            tgt = layer(tgt, memory)
+    def forward(self, x:Tensor, encoder_output:Tensor) -> Tensor:
+        """
+        Process target sequence and encoder output through the decoder.
         
-        return torch.softmax(self.linear(tgt), dim=-1)
+        The forward pass consists of:
+        1. Processing through each decoder layer
+        2. Final linear projection and softmax
+        
+        Args:
+            x: Target sequence tensor of shape [batch_size, seq_len, dim_embedding] with positional encoding
+            encoder_output: Encoder output tensor of shape [batch_size, src_seq_len, dim_embedding]
+            
+        Returns:
+            Output tensor of shape [batch_size, seq_len, output_dim] with probabilities
+            after softmax activation
+        """
+        # Process through each decoder layer
+        decoder_output = x
+        for layer in self.layers:
+            decoder_output = layer(decoder_output, encoder_output)
+        
+        # Final linear projection and softmax
+        logits = self.linear(decoder_output)
+        return torch.softmax(logits, dim=-1)

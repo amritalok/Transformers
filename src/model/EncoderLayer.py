@@ -1,16 +1,22 @@
-import os
 import torch
 from torch import nn
-from torchvision.datasets import MNIST
-from torch.utils.data import DataLoader
-from torchvision import transforms
 import pytorch_lightning as pl
-from torch.nn import functional as f
-from utils.Helper import *
+from torch import Tensor
+from utils.Helper import feed_forward
 from model.MultiHeadAttention import MultiHeadAttention
 from model.Residual import Residual
 
 class EncoderLayer(pl.LightningModule):
+    """
+    EncoderLayer class implements a single layer of the Transformer encoder.
+    
+    As described in 'Attention is All You Need' (Vaswani et al., 2017), each encoder layer consists of:
+    1. Multi-head self-attention mechanism
+    2. Position-wise feed-forward network
+    Both sublayers have residual connections and are followed by layer normalization.
+    
+    The encoder processes the input sequence and produces representations that are used by the decoder.
+    """
     def __init__(
         self, 
         dim_embedding: int = 512,
@@ -18,21 +24,53 @@ class EncoderLayer(pl.LightningModule):
         dim_feedforward: int = 2048,
         dropout: float = 0.1
     ):
+        """
+        Initialize an EncoderLayer instance.
+        
+        Args:
+            dim_embedding: Dimension of the input embeddings (default: 512)
+            num_heads: Number of attention heads (default: 6)
+            dim_feedforward: Dimension of the feedforward network (default: 2048)
+            dropout: Dropout rate (default: 0.1)
+        """
         super().__init__()
+        
+        # Calculate dimension for each attention head
         dim_k = dim_v = dim_embedding // num_heads
+        
+        # Multi-head attention with residual connection and layer normalization
         self.attention = Residual(
             MultiHeadAttention(num_heads, dim_embedding, dim_k, dim_v),
             dimension = dim_embedding,
             dropout = dropout
         )
+        
+        # Position-wise feed-forward network with residual connection and layer normalization
         self.feed_forward = Residual(
             feed_forward(dim_embedding, dim_feedforward),
             dimension = dim_embedding,
             dropout = dropout
         )
     
-    def forward(self, src:Tensor) -> Tensor:
-        src = self.attention(src, src, src)
-        return self.feed_forward(src)
+    def forward(self, x:Tensor) -> Tensor:
+        """
+        Process input through the encoder layer.
+        
+        The forward pass consists of:
+        1. Self-attention where query, key, and value all come from the same source
+        2. Feed-forward network
+        
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, dim_embedding]
+            
+        Returns:
+            Processed tensor of the same shape as input
+        """
+        # Self-attention mechanism - same input for query, key, and value
+        # In self-attention, query, key, and value all come from the same source
+        attention_output = self.attention(x, x, x)
+        
+        # Position-wise feed-forward network
+        return self.feed_forward(attention_output)
 
 

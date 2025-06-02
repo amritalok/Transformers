@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "transformers-project"
+version = "0.1.0"
+description = "Transformer model implementation"
+authors = ["Aalok <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.9,<4.0"  # Updated Python version requirement for spaCy compatibility
+torch = ">=2.7.0,<3.0.0"
+pytorch-lightning = "^2.2.0"
+transformers = "^4.52.0"
+datasets = "^2.17.0"
+tokenizers = "^0.21.0"
+sentencepiece = "^0.2.0"
+protobuf = "^4.25.0"
+tensorboard = "^2.15.0"
+spacy = "^3.7.0"
+numpy = "^1.24.0"
+tqdm = "^4.65.0"
+matplotlib = "^3.7.0"
+sacremoses = "^0.1.1"
+evaluate = "^0.4.3"
+accelerate = "^1.7.0"
+sacrebleu = "^2.5.1"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.3.1"
+black = "^23.3.0"
+isort = "^5.12.0"
+flake8 = "^6.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
