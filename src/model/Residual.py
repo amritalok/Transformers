@@ -28,7 +28,7 @@ class Residual(pl.LightningModule):
         self.norm = nn.LayerNorm(dimension)  # Layer normalization
         self.dropout = nn.Dropout(dropout)  # Dropout for regularization
     
-    def forward(self, *tensors:Tensor) -> Tensor:
+    def forward(self, *tensors:Tensor, **kwargs) -> Tensor:
         """
         Apply sublayer with residual connection and layer normalization.
         
@@ -37,10 +37,11 @@ class Residual(pl.LightningModule):
         
         Args:
             *tensors: Input tensors to the sublayer. The last tensor is used for the residual connection.
+            **kwargs: Additional keyword arguments to pass to the sublayer (e.g., mask).
             
         Returns:
             Output tensor after applying sublayer, dropout, residual connection, and layer normalization
         """
-        # Apply sublayer to all input tensors, apply dropout, add residual connection, and normalize
-        return self.norm(tensors[-1] + self.dropout(self.sublayer(*tensors)))
+        # Apply sublayer to all input tensors with kwargs, apply dropout, add residual connection, and normalize
+        return self.norm(tensors[-1] + self.dropout(self.sublayer(*tensors, **kwargs)))
 

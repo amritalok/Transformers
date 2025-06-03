@@ -61,8 +61,9 @@ def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(dim_k)
     
     # Apply mask (if provided) by setting masked positions to a large negative value
+    # Use -65500 instead of -1e9 for FP16 compatibility (FP16 range is approximately ±65504)
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
+        scores = scores.masked_fill(mask == 0, -65500.0)
 
     # Apply softmax to get attention weights
     # Shape: [batch_size, seq_len_q, seq_len_k]
