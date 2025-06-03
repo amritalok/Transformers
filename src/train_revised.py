@@ -759,9 +759,12 @@ def main():
         last_checkpoint_dir = os.path.join(training_args.output_dir, "checkpoint-last")
         logger.info(f"Explicitly saving final model and tokenizer to {last_checkpoint_dir} for resumption.")
         try:
-            # trainer._save_checkpoint() is the method for saving a full checkpoint
-            # including model, tokenizer, training_args, and trainer_state.json.
-            trainer._save_checkpoint(last_checkpoint_dir)
+            # Save model and tokenizer
+            trainer.save_model(last_checkpoint_dir)
+            # Save the Trainer state (for resumption)
+            trainer.state.save_to_json(os.path.join(last_checkpoint_dir, "trainer_state.json"))
+            # Save training arguments (for completeness)
+            torch.save(training_args, os.path.join(last_checkpoint_dir, "training_args.bin"))
             logger.info(f"Successfully saved checkpoint to {last_checkpoint_dir}.")
         except Exception as e:
             logger.error(f"Failed to save to {last_checkpoint_dir}: {e}", exc_info=True)
