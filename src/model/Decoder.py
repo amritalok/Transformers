@@ -49,7 +49,7 @@ class Decoder(pl.LightningModule):
         self.linear = nn.Linear(dim_embedding, self.output_dim)
     
 
-    def forward(self, x:Tensor, encoder_output:Tensor) -> Tensor:
+    def forward(self, x:Tensor, encoder_output:Tensor, src_padding_mask=None) -> Tensor:
         """
         Process target sequence and encoder output through the decoder.
         
@@ -60,6 +60,8 @@ class Decoder(pl.LightningModule):
         Args:
             x: Target sequence tensor of shape [batch_size, seq_len, dim_embedding] with positional encoding
             encoder_output: Encoder output tensor of shape [batch_size, src_seq_len, dim_embedding]
+            src_padding_mask: Optional mask for padding tokens in the source sequence,
+                             with shape [batch_size, src_seq_len]
             
         Returns:
             Output tensor of shape [batch_size, seq_len, output_dim] with probabilities
@@ -68,7 +70,8 @@ class Decoder(pl.LightningModule):
         # Process through each decoder layer
         decoder_output = x
         for layer in self.layers:
-            decoder_output = layer(decoder_output, encoder_output)
+            # Pass the src_padding_mask to each decoder layer
+            decoder_output = layer(decoder_output, encoder_output, src_padding_mask)
         
         # Final linear projection and softmax
         logits = self.linear(decoder_output)

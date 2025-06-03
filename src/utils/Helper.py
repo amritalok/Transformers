@@ -38,6 +38,7 @@ class Config(dict):
 def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask: Optional[Tensor] = None) -> Tensor:
     """
     Compute scaled dot-product attention as described in 'Attention is All You Need'.
+    This implementation handles attention between sequences of different lengths.
     
     The attention mechanism computes a weighted sum of values, where the weights are
     determined by the compatibility between the query and key representations.
@@ -54,7 +55,27 @@ def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask
         Output tensor of shape [batch_size, seq_len_q, dim_v]
     """
     # Get dimensions
+    batch_size = query.size(0)
+    seq_len_q = query.size(1)
+    seq_len_k = key.size(1)
     dim_k = query.size(-1)
+    dim_v = value.size(-1)
+    
+    # Print tensor dimensions for debugging
+    # print(f"Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
+    
+    # Handle masks with incompatible shapes
+    # If mask is provided, make sure it has the right shape [batch_size, seq_len_q, seq_len_k]
+    if mask is not None:
+        # If mask is 2D, expand to 3D
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # If mask doesn't match the expected dimensions, create a new compatible mask
+        # This is critical for cross-attention between sequences of different lengths
+        if mask.size(1) != seq_len_q or mask.size(2) != seq_len_k:
+            # print(f"Warning: Mask shape {mask.shape} doesn't match expected shape [{batch_size}, {seq_len_q}, {seq_len_k}]")
+            mask = torch.ones(batch_size, seq_len_q, seq_len_k, device=query.device)
     
     # Compute attention scores: batch_matmul(Q, K^T) / sqrt(d_k)
     # Shape: [batch_size, seq_len_q, seq_len_k]

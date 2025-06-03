@@ -52,7 +52,7 @@ class EncoderLayer(pl.LightningModule):
             dropout = dropout
         )
     
-    def forward(self, x:Tensor) -> Tensor:
+    def forward(self, x: Tensor, src_padding_mask: Tensor = None) -> Tensor:
         """
         Process input through the encoder layer.
         
@@ -62,15 +62,19 @@ class EncoderLayer(pl.LightningModule):
         
         Args:
             x: Input tensor of shape [batch_size, seq_len, dim_embedding]
-            
+            src_padding_mask: Optional mask for padding tokens in the source sequence
+                              Shape: [batch_size, 1, seq_len] or [batch_size, seq_len, seq_len]
+
         Returns:
             Processed tensor of the same shape as input
         """
-        # Self-attention mechanism - same input for query, key, and value
-        # In self-attention, query, key, and value all come from the same source
-        attention_output = self.attention(x, x, x)
+        # Self-attention mechanism
+        # self.attention is Residual(MHA_self_encoder)
+        # Pass x for residual, then x,x,x for MHA's q,k,v, then mask.
+        attention_output = self.attention(x, x, x, x, mask=src_padding_mask)
         
         # Position-wise feed-forward network
-        return self.feed_forward(attention_output)
-
-
+        # self.feed_forward is Residual(FeedForwardNetwork)
+        # Pass attention_output for residual, then attention_output as input to FFN.
+        ff_output = self.feed_forward(attention_output, attention_output)
+        return ff_output

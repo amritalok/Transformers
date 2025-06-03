@@ -14,7 +14,7 @@ import torch
 import numpy as np
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 
 # Hugging Face imports
 import evaluate
@@ -35,13 +35,26 @@ class SaveLastCheckpointCallback(TrainerCallback):
     """Callback to save the model and tokenizer at the end of training."""
     def on_train_end(self, args, state, control, model=None, tokenizer=None, **kwargs):
         """Save model and tokenizer when training ends."""
+        callback_logger = logging.getLogger(f"{__name__}.SaveLastCheckpointCallback")
+        callback_logger.info("SaveLastCheckpointCallback.on_train_end called.")
         if model is not None and tokenizer is not None:
             checkpoint_dir = os.path.join(args.output_dir, "checkpoint-last")
-            logger = logging.getLogger(__name__)
-            logger.info(f"Saving final model checkpoint to {checkpoint_dir}")
-            model.save_pretrained(checkpoint_dir)
-            tokenizer.save_pretrained(checkpoint_dir)
-            logger.info("Final checkpoint saved successfully")
+            callback_logger.info(f"Attempting to save final model checkpoint to {checkpoint_dir}")
+            try:
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                callback_logger.info(f"Ensured directory exists: {checkpoint_dir}")
+                
+                model.save_pretrained(checkpoint_dir)
+                callback_logger.info(f"Model saved to {checkpoint_dir}")
+                
+                tokenizer.save_pretrained(checkpoint_dir)
+                callback_logger.info(f"Tokenizer saved to {checkpoint_dir}")
+                
+                callback_logger.info(f"Final checkpoint (model and tokenizer) saved successfully to {checkpoint_dir}")
+            except Exception as e:
+                callback_logger.error(f"Error during SaveLastCheckpointCallback in on_train_end: {e}", exc_info=True)
+        else:
+            callback_logger.warning("SaveLastCheckpointCallback.on_train_end: Model or Tokenizer is None. Cannot save checkpoint-last.")
 
 
 @dataclass
@@ -231,155 +244,122 @@ class TransformerTrainer(Seq2SeqTrainer):
             kwargs['args'].remove_unused_columns = False
         super().__init__(*args, **kwargs)
     
-    def _prepare_inputs(self, inputs):
+    def _prepare_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Prepare inputs for the model from the dataset columns.
-        Map dataset columns to the names expected by the model.
+        Prepare inputs for the model. This version assumes the CustomDataCollator
+        has already prepared src_tokens, tgt_tokens_input, and tgt_tokens_target.
+        Relies on super()._prepare_inputs() for device placement and AMP handling.
+        Ensures 'tgt_tokens' (expected by model.forward) is mapped from 'tgt_tokens_input'.
         """
-        # Map the Hugging Face dataset column names to what our model expects
-        prepared_inputs = {}
+        prepared_inputs = super()._prepare_inputs(inputs)
+
+        if 'tgt_tokens_input' in prepared_inputs and 'tgt_tokens' not in prepared_inputs:
+            prepared_inputs['tgt_tokens'] = prepared_inputs['tgt_tokens_input']
+        elif 'tgt_tokens' in prepared_inputs and 'tgt_tokens_input' not in prepared_inputs:
+             prepared_inputs['tgt_tokens_input'] = prepared_inputs['tgt_tokens']
         
-        if 'input_ids' in inputs:
-            # Source tokens for the encoder
-            prepared_inputs['src_tokens'] = inputs['input_ids']
-            
-            # For the decoder, we need input (shifted right) and target
-            if 'labels' in inputs:
-                # In teacher forcing, the input to the decoder is the target shifted right
-                # (starting with BOS token)
-                # The target for loss calculation is the original target sequence
-                
-                # Get the labels (target sequence)
-                target_ids = inputs['labels'].clone()
-                
-                # Create input for the decoder (target shifted right)
-                # We'll use the tokenizer's pad, bos, and eos tokens
-                pad_token_id = self.tokenizer.pad_token_id if hasattr(self, 'tokenizer') else 0
-                bos_token_id = self.tokenizer.bos_token_id if hasattr(self, 'tokenizer') else 2
-                
-                # Create decoder input by shifting target right and prepending BOS token
-                decoder_input = torch.full_like(target_ids, pad_token_id)
-                decoder_input[:, 0] = bos_token_id
-                decoder_input[:, 1:] = target_ids[:, :-1].clone()
-                
-                # Set inputs for decoder
-                prepared_inputs['tgt_tokens_input'] = decoder_input
-                prepared_inputs['tgt_tokens_target'] = target_ids
-        
-        # Add any other keys that might be used elsewhere
-        for k, v in inputs.items():
-            if k not in prepared_inputs:
-                prepared_inputs[k] = v
-        
-        # Call parent class method to handle device placement, etc.
-        return super()._prepare_inputs(prepared_inputs)
-    
+        return prepared_inputs
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Inputs are already prepared by _prepare_inputs
-        # We accept **kwargs to handle any additional parameters like num_items_in_batch
-        device = model.device
-        src_tokens = inputs['src_tokens'].to(device)
-        tgt_tokens_input = inputs['tgt_tokens_input'].to(device)
-        tgt_tokens_target = inputs['tgt_tokens_target'].to(device)
+        src_tokens = inputs.get("src_tokens")
+        tgt_tokens_input_for_model = inputs.get("tgt_tokens") 
+        tgt_tokens_target = inputs.get("tgt_tokens_target")
         
-        # Forward pass through the model
-        outputs = model(src_tokens, tgt_tokens_input)
+        if src_tokens is None or tgt_tokens_input_for_model is None or tgt_tokens_target is None:
+            logger = logging.getLogger(__name__)
+            logger.error(f"compute_loss missing critical inputs. Available: {list(inputs.keys())}")
+            if return_outputs:
+                return torch.tensor(float('nan'), device=model.device), {}
+            return torch.tensor(float('nan'), device=model.device)
+
+        outputs = model(src_tokens, tgt_tokens_input_for_model)
         
-        # Check if shapes match and adjust if needed
-        # outputs shape: [batch_size, seq_len, vocab_size]
-        # tgt_tokens_target shape: [batch_size, seq_len]
+        # outputs shape: [B, S_out, V], tgt_tokens_target shape: [B, S_tgt]
+        # S_out (from decoder based on tgt_tokens_input) is max_label_len
+        # S_tgt (from collator based on labels[:, 1:]) is max_label_len - 1
+        # Slice outputs to match the target length for loss calculation.
+        # We want to compare predictions for t_1...t_L-1 with actual t_1...t_L-1.
+        # The 0-th output logit corresponds to predicting the token at target index 0 (which is labels[1]).
+        # The (L-2)-th output logit corresponds to predicting token at target index L-2 (which is labels[L-1]).
+        # So, we need outputs up to sequence length L-1 (i.e., outputs[:, :tgt_tokens_target.shape[1], :]).
+        sliced_outputs = outputs[:, :tgt_tokens_target.shape[1], :].contiguous()
         
-        # Make sure the sequence lengths match for loss calculation
-        output_seq_len = outputs.size(1)
-        target_seq_len = tgt_tokens_target.size(1)
+        reshaped_outputs = sliced_outputs.reshape(-1, sliced_outputs.shape[-1])
+        reshaped_targets = tgt_tokens_target.reshape(-1)
         
-        if output_seq_len != target_seq_len:
-            # Truncate the longer one to match the shorter one
-            if output_seq_len > target_seq_len:
-                outputs = outputs[:, :target_seq_len, :]
-            else:
-                tgt_tokens_target = tgt_tokens_target[:, :output_seq_len]
-        
-        # Reshape predictions and targets for loss calculation
         try:
-            # Log shapes before reshaping for debugging
-            batch_size, seq_len, vocab_size = outputs.shape
-            target_batch_size, target_seq_len = tgt_tokens_target.shape
-            
-            # Reshape carefully to ensure matching batch sizes
-            reshaped_outputs = outputs.reshape(-1, vocab_size)  # [batch_size*seq_len, vocab_size]
-            reshaped_targets = tgt_tokens_target.reshape(-1)  # [batch_size*seq_len]
-            
-            # Double-check that shapes match
-            if reshaped_outputs.size(0) != reshaped_targets.size(0):
-                # If they still don't match, truncate to the smaller size
-                min_size = min(reshaped_outputs.size(0), reshaped_targets.size(0))
-                reshaped_outputs = reshaped_outputs[:min_size, :]
-                reshaped_targets = reshaped_targets[:min_size]
-            
             loss = model.criterion(reshaped_outputs, reshaped_targets)
-        except Exception as e:
-            # If we still have issues, fall back to a simpler approach
-            print(f"Error in loss calculation: {e}")
-            print(f"Output shape: {outputs.shape}, Target shape: {tgt_tokens_target.shape}")
-            
-            # Use a mask to calculate loss only on valid positions
-            mask = (tgt_tokens_target != -100)  # -100 is padding index for loss
-            outputs = outputs.masked_select(mask.unsqueeze(-1).expand_as(outputs)).view(-1, outputs.size(-1))
-            tgt_tokens_target = tgt_tokens_target.masked_select(mask)
-            loss = model.criterion(outputs, tgt_tokens_target)
+        except RuntimeError as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error in loss calculation: {e}. Output shape: {outputs.shape}, Target shape for loss: {tgt_tokens_target.shape}")
+            min_len = min(reshaped_outputs.shape[0], reshaped_targets.shape[0])
+            if min_len > 0:
+                loss = model.criterion(reshaped_outputs[:min_len], reshaped_targets[:min_len])
+            else:
+                loss = torch.tensor(float('nan'), device=model.device)
         
         return (loss, outputs) if return_outputs else loss
     
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None, **kwargs):
-        # Inputs may be None or not properly formatted during evaluation
-        # We need to handle this gracefully
         device = model.device
+        current_logger = logging.getLogger(__name__)
+
+        required_input_keys = ['src_tokens', 'tgt_tokens_input', 'tgt_tokens_target']
+        if inputs is None or not all(k in inputs for k in required_input_keys):
+            current_logger.warning(f"Inputs missing or malformed during prediction step. Expected: {required_input_keys}. Got: {list(inputs.keys() if inputs else [])}")
+            dummy_loss = torch.tensor(float('nan'), device=device)
+            return (dummy_loss, None, None)
         
-        # Make sure inputs is not None and contains the required keys
-        if inputs is None or not all(k in inputs for k in ['src_tokens', 'tgt_tokens_input', 'tgt_tokens_target']):
-            if not hasattr(self, "warned_about_inputs"):
-                # Use logging directly since we already imported it at the top of the file
-                logging.warning("Inputs missing or malformed during prediction step. "
-                           "Ensure _prepare_inputs is working correctly.")
-                self.warned_about_inputs = True
-            
-            # Try to prepare inputs again if needed
-            if hasattr(self, "_prepare_inputs") and inputs is not None:
-                inputs = self._prepare_inputs(inputs)
-            
-            # If still not properly formatted, return a dummy loss to avoid crashing
-            if inputs is None or not all(k in inputs for k in ['src_tokens', 'tgt_tokens_input', 'tgt_tokens_target']):
-                dummy_loss = torch.tensor(float('nan'), device=device)
-                if prediction_loss_only:
-                    return (dummy_loss, None, None)
-                else:
-                    return (dummy_loss, None, None)
+        src_tokens = inputs['src_tokens']
+        tgt_tokens_for_model = inputs.get('tgt_tokens', inputs['tgt_tokens_input'])
+        tgt_tokens_target = inputs['tgt_tokens_target']
         
-        # Now we can safely access the inputs
-        src_tokens = inputs['src_tokens'].to(device)
-        tgt_tokens_input = inputs['tgt_tokens_input'].to(device)
-        tgt_tokens_target = inputs['tgt_tokens_target'].to(device)
+        current_logger.debug(f"prediction_step shapes: src_tokens={src_tokens.shape}, tgt_tokens_for_model={tgt_tokens_for_model.shape}, tgt_tokens_target={tgt_tokens_target.shape}")
         
         try:
             with torch.no_grad():
-                # Forward pass through the model
-                outputs = model(src_tokens, tgt_tokens_input)
-                loss = model.criterion(outputs.reshape(-1, outputs.shape[-1]), tgt_tokens_target.reshape(-1))
+                outputs = model(src_tokens, tgt_tokens_for_model)
+                
+                # Align sequence lengths before batch dimension check or loss calculation
+                # outputs shape: [B, S_out, V], tgt_tokens_target shape: [B, S_tgt]
+                # S_out is max_label_len, S_tgt is max_label_len - 1
+                # Slice outputs to match the target length for loss calculation.
+                if outputs.shape[1] > tgt_tokens_target.shape[1]: # If model output seq_len > target seq_len
+                    sliced_model_outputs = outputs[:, :tgt_tokens_target.shape[1], :].contiguous()
+                elif outputs.shape[1] < tgt_tokens_target.shape[1]: # Should not happen with current collator
+                    current_logger.warning(f"prediction_step: model output seq_len ({outputs.shape[1]}) < target seq_len ({tgt_tokens_target.shape[1]}). Truncating target.")
+                    sliced_model_outputs = outputs.contiguous()
+                    tgt_tokens_target = tgt_tokens_target[:, :outputs.shape[1]].contiguous() 
+                else: # Sequence lengths match
+                    sliced_model_outputs = outputs.contiguous()
+
+                tgt_tokens_target_for_loss = tgt_tokens_target # Start with the full target
+
+                # First, ensure batch dimensions match between sliced_model_outputs and tgt_tokens_target_for_loss
+                if sliced_model_outputs.shape[0] != tgt_tokens_target_for_loss.shape[0]:
+                    current_logger.warning(
+                        f"Batch size mismatch in prediction_step after seq slicing: sliced_model_outputs.shape[0]={sliced_model_outputs.shape[0]}, "
+                        f"tgt_tokens_target_for_loss.shape[0]={tgt_tokens_target_for_loss.shape[0]}. Adjusting batch size."
+                    )
+                    min_batch_size = min(sliced_model_outputs.shape[0], tgt_tokens_target_for_loss.shape[0])
+                    if min_batch_size == 0:
+                        current_logger.error("Cannot compute loss with zero batch size after batch adjustment in prediction_step.")
+                        raise ValueError("Cannot compute loss with zero batch size after batch adjustment.")
+                    sliced_model_outputs = sliced_model_outputs[:min_batch_size]
+                    tgt_tokens_target_for_loss = tgt_tokens_target_for_loss[:min_batch_size]
+                
+                # Now, sequence lengths of sliced_model_outputs and tgt_tokens_target_for_loss should match
+                # from the earlier slicing logic. Batch sizes also match now.
+                loss = model.criterion(sliced_model_outputs.reshape(-1, sliced_model_outputs.shape[-1]), tgt_tokens_target_for_loss.reshape(-1))
                 
                 if prediction_loss_only:
                     return (loss, None, None)
                 
-                # Return loss, logits, and labels
                 return (loss, outputs, tgt_tokens_target)
         except Exception as e:
-            logging.error(f"Error during prediction step: {e}")
-            # Return dummy values to avoid crashing
+            current_logger.error(f"Error during prediction step: {e}", exc_info=True)
             dummy_loss = torch.tensor(float('nan'), device=device)
-            if prediction_loss_only:
-                return (dummy_loss, None, None)
-            else:
-                return (dummy_loss, None, None)
+            return (dummy_loss, None, None)
 
 
 def main():
@@ -390,6 +370,12 @@ def main():
     # Parse arguments using HfArgumentParser
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # Ensure output_dir is set for checkpointing and logging
+    if training_args.output_dir is None:
+        training_args.output_dir = "./outputs" # Default output directory
+        logger.info(f"output_dir not set, defaulting to {training_args.output_dir}")
+    os.makedirs(training_args.output_dir, exist_ok=True)
     
     # Setup logging
     logging.basicConfig(
@@ -465,7 +451,25 @@ def main():
     
     # Helper function to get a subset of the dataset
     def get_subset(dataset, fraction, seed=42):
-        n = int(len(dataset) * fraction)
+        original_len = len(dataset)
+        logger.info(f"get_subset called: original_len={original_len}, fraction={fraction}")
+        if original_len == 0:
+            logger.warning("get_subset: Input dataset is empty.")
+            return dataset
+        if fraction <= 0:
+            logger.warning(f"get_subset: Fraction is {fraction}, returning empty dataset.")
+            return dataset.select(range(0)) # Return an empty dataset of the same type
+        
+        n = int(original_len * fraction)
+        if n == 0 and original_len > 0 and fraction > 0:
+            logger.warning(f"get_subset: Calculated n=0 for non-empty dataset (len={original_len}, frac={fraction}). Selecting at least 1 sample.")
+            n = 1 # Ensure at least one sample if original dataset is not empty and fraction > 0
+        
+        logger.info(f"get_subset: Selecting {n} samples.")
+        if n > original_len:
+            logger.warning(f"get_subset: Calculated n={n} is greater than original_len={original_len}. Selecting all samples.")
+            n = original_len
+            
         # Use a deterministic shuffle for reproducibility
         return dataset.shuffle(seed=seed).select(range(n))
     
@@ -604,35 +608,94 @@ def main():
         training_args.warmup_steps = 500
         logger.info(f"Set warmup steps to {training_args.warmup_steps}")
         
-    # Metric for evaluation
-    metric = evaluate.load("sacrebleu")
-        
+    logger.info("Loading BLEU metric...")
+    try:
+        bleu_metric_for_eval = evaluate.load("bleu")
+    except Exception as e:
+        logger.error(f"Failed to load BLEU metric: {e}. Evaluation will not have BLEU scores.")
+        bleu_metric_for_eval = None
+
     def compute_metrics(eval_preds):
-        preds, labels = eval_preds
+        # tokenizer should be in the scope of main() or passed appropriately
+        # bleu_metric_for_eval is from the scope of main()
+        
+        preds_logits, label_ids = eval_preds
+        
+        if preds_logits is None:
+            logger.error("Predictions (logits) are None in compute_metrics.")
+            return {"eval_bleu": 0.0, "gen_len": 0.0, "eval_bp": 0.0}
+
+        if np.isnan(preds_logits).any():
+            logger.warning("NaN found in predictions (logits) in compute_metrics. Skipping.")
+            return {"eval_bleu": 0.0, "gen_len": 0.0, "eval_bp": 0.0}
+
+        try:
+            # Get actual token ID predictions from logits
+            predictions_token_ids = np.argmax(preds_logits, axis=-1)
+        except Exception as e:
+            logger.error(f"Error in np.argmax (preds_logits shape: {preds_logits.shape if hasattr(preds_logits, 'shape') else 'N/A'}): {e}")
+            return {"eval_bleu": 0.0, "gen_len": 0.0, "eval_bp": 0.0}
+
+        # Replace -100 in the label_ids as we can't decode them.
+        processed_label_ids = np.where(label_ids != -100, label_ids, tokenizer.pad_token_id)
+
+        try:
+            decoded_preds_raw = tokenizer.batch_decode(predictions_token_ids, skip_special_tokens=True)
+            decoded_labels_raw = tokenizer.batch_decode(processed_label_ids, skip_special_tokens=True)
+        except Exception as e:
+            logger.error(f"Error decoding predictions/labels in compute_metrics: {e}")
+            return {"eval_bleu": 0.0, "gen_len": 0.0, "eval_bp": 0.0}
+
+        # Prepare for BLEU: list of lists for references, list of strings for predictions
+        # Strip whitespace as it can affect BLEU and is often not desired.
+        decoded_labels_for_bleu = [[label.strip()] for label in decoded_labels_raw]
+        decoded_preds_for_bleu = [pred.strip() for pred in decoded_preds_raw]
+        
+        bleu_score_val = 0.0
+        brevity_penalty_val = 0.0
+
+        if bleu_metric_for_eval is not None:
+            # Filter out pairs where either prediction or reference is empty after stripping,
+            # as this can cause issues or lead to misleading BLEU scores (e.g., 0/0 division).
+            valid_pred_strings = []
+            valid_ref_lists = []
+            for pred_str, ref_list_str in zip(decoded_preds_for_bleu, decoded_labels_for_bleu):
+                if pred_str and ref_list_str[0]: # Ensure both pred and its single ref are non-empty
+                    valid_pred_strings.append(pred_str)
+                    valid_ref_lists.append(ref_list_str)
             
+            if not valid_pred_strings: # Or check valid_ref_lists, they should have same length
+                logger.warning("No valid (non-empty) prediction/reference pairs for BLEU calculation after stripping.")
+            else:
+                try:
+                    # logger.debug(f"Calculating BLEU with {len(valid_pred_strings)} pairs.")
+                    # logger.debug(f"Sample pred for BLEU: '{valid_pred_strings[0]}'")
+                    # logger.debug(f"Sample ref for BLEU: {valid_ref_lists[0]}")
+                    bleu_result = bleu_metric_for_eval.compute(predictions=valid_pred_strings, references=valid_ref_lists)
+                    if bleu_result:
+                        bleu_score_val = bleu_result.get('bleu', 0.0)
+                        brevity_penalty_val = bleu_result.get('brevity_penalty', 0.0)
+                        # logger.debug(f"Full BLEU result: {bleu_result}")
+                except Exception as e:
+                    logger.error(f"Error computing BLEU score with bleu_metric_for_eval: {e}")
+                    # logger.error(f"Preds for BLEU: {valid_pred_strings[:2]}")
+                    # logger.error(f"Refs for BLEU: {valid_ref_lists[:2]}")
+
+        else:
+            logger.warning("BLEU metric loader not available. BLEU score will be 0.")
+
+        # Calculate mean generated length from original (pre-strip) decoded_preds
+        # Using decoded_preds_raw as stripping might change length if only spaces were predicted.
+        gen_len = np.mean([len(p.split()) for p in decoded_preds_raw]) if decoded_preds_raw else 0.0
+
+        final_metrics = {
+            'bleu': round(float(bleu_score_val), 4),
+            'gen_len': round(float(gen_len), 4) if not np.isnan(gen_len) else 0.0,
+            'bp': round(float(brevity_penalty_val), 4)
+        }
         
-        # Ignore padding in labels (-100)
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-        
-        # Get predictions (argmax)
-        if isinstance(preds, tuple):
-            preds = preds[0]
-        predictions = np.argmax(preds, axis=-1)
-        
-        # Decode predictions and labels
-        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        
-        # Compute BLEU score
-        result = metric.compute(
-            predictions=decoded_preds,
-            references=[[label] for label in decoded_labels]
-        )
-        
-        # Add mean generated length
-        result["gen_len"] = np.mean([len(pred.split()) for pred in decoded_preds])
-        
-        return {k: round(v, 4) for k, v in result.items()}
+        # logger.info(f"Computed metrics: {final_metrics}") # For debugging
+        return final_metrics
     
     # Initialize Trainer with detailed logging
     logger.info("Initializing Trainer with the following settings:")
@@ -661,7 +724,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        processing_class=tokenizer,  # Changed from 'tokenizer' to 'processing_class' to fix deprecation warning
+        tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=callbacks  # Add custom callbacks for checkpoint management
@@ -675,12 +738,13 @@ def main():
         start_time = time.time()
         
         # Check for existing checkpoints to resume training
+        logger.info(f"Checking for checkpoint. training_args.output_dir='{training_args.output_dir}', training_args.overwrite_output_dir is {training_args.overwrite_output_dir}")
         checkpoint_dir = os.path.join(training_args.output_dir, "checkpoint-last")
         if os.path.exists(checkpoint_dir) and not training_args.overwrite_output_dir:
             logger.info(f"Resuming training from checkpoint in {checkpoint_dir}")
             train_result = trainer.train(resume_from_checkpoint=checkpoint_dir)
         else:
-            logger.info("Starting training from scratch")
+            logger.info(f"Starting training from scratch. Reason: checkpoint_dir '{checkpoint_dir}' exists? {os.path.exists(checkpoint_dir)}. overwrite_output_dir? {training_args.overwrite_output_dir}.")
             train_result = trainer.train()
         
         # Calculate training time
@@ -689,7 +753,18 @@ def main():
         
         # Save the model and training metrics
         logger.info(f"Saving model to {training_args.output_dir}")
-        trainer.save_model()  # Saves the tokenizer too
+        trainer.save_model()  # Saves the model and tokenizer to training_args.output_dir (e.g. ./outputs/)
+
+        # Explicitly save to 'checkpoint-last' for reliable resumption
+        last_checkpoint_dir = os.path.join(training_args.output_dir, "checkpoint-last")
+        logger.info(f"Explicitly saving final model and tokenizer to {last_checkpoint_dir} for resumption.")
+        try:
+            # trainer._save_checkpoint() is the method for saving a full checkpoint
+            # including model, tokenizer, training_args, and trainer_state.json.
+            trainer._save_checkpoint(last_checkpoint_dir)
+            logger.info(f"Successfully saved checkpoint to {last_checkpoint_dir}.")
+        except Exception as e:
+            logger.error(f"Failed to save to {last_checkpoint_dir}: {e}", exc_info=True)
         
         # Save model in a format optimized for Mac M3 inference
         try:
@@ -782,7 +857,7 @@ def main():
                     max_length=data_args.max_target_length,
                     num_beams=num_beams,
                     early_stopping=True,
-                    decoder_start_token_id=tokenizer.bos_token_id,  # Ensure proper start token for MarianTokenizer
+                    decoder_start_token_id=tokenizer.pad_token_id, # Marian models often use pad_token_id as the decoder_start_token_id
                     length_penalty=0.6  # Favor slightly longer translations (better for BLEU)
                 )
             

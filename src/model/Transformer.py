@@ -131,13 +131,39 @@ class Transformer(pl.LightningModule):
             Output tensor of shape [batch_size, tgt_seq_len, tgt_vocab_size] with probabilities
             after softmax activation
         """
-        # Get sequence lengths for positional encoding
+        # Get sequence lengths and batch size
+        batch_size = src_tokens.size(0)
         src_seq_len = src_tokens.size(1)
         tgt_seq_len = tgt_tokens.size(1)
+        
+        # Create padding mask for source sequence (1 for tokens, 0 for padding)
+        # This will be used to mask out padding tokens in attention
+        src_padding_mask = (src_tokens != self.pad_idx).float()  # Shape: [batch_size, src_seq_len]
         
         # Convert token IDs to embeddings and scale
         src_embeddings = self.src_embedding(src_tokens) * self.embedding_scale
         tgt_embeddings = self.tgt_embedding(tgt_tokens) * self.embedding_scale
+        
+        # Add positional encoding, handling possible sequence length differences
+        max_pos_len = self.positional_encoding.size(1)
+        
+        # Ensure we don't exceed the pre-computed positional encoding length
+        src_seq_len_capped = min(src_seq_len, max_pos_len)
+        tgt_seq_len_capped = min(tgt_seq_len, max_pos_len)
+        
+        # If source sequence is too long, truncate it for positional encoding
+        if src_seq_len > max_pos_len:
+            print(f"Warning: Source sequence length {src_seq_len} exceeds maximum positional encoding length {max_pos_len}")
+            src_embeddings = src_embeddings[:, :max_pos_len, :]
+            src_padding_mask = src_padding_mask[:, :max_pos_len]
+            src_seq_len = max_pos_len
+        
+        # If target sequence is too long, truncate it for positional encoding
+        if tgt_seq_len > max_pos_len:
+            print(f"Warning: Target sequence length {tgt_seq_len} exceeds maximum positional encoding length {max_pos_len}")
+            tgt_embeddings = tgt_embeddings[:, :max_pos_len, :]
+            tgt_tokens = tgt_tokens[:, :max_pos_len]
+            tgt_seq_len = max_pos_len
         
         # Add positional encoding
         src_embeddings = src_embeddings + self.positional_encoding[:, :src_seq_len, :]
@@ -151,7 +177,8 @@ class Transformer(pl.LightningModule):
         encoder_output = self.encoder(src_embeddings)
         
         # Then decode using the encoded source and target embeddings
-        return self.decoder(tgt_embeddings, encoder_output)
+        # Pass the source padding mask to handle different sequence lengths
+        return self.decoder(tgt_embeddings, encoder_output, src_padding_mask)
     
     def training_step(self, batch, batch_idx):
         """
@@ -196,3 +223,72 @@ class Transformer(pl.LightningModule):
         """
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         return optimizer
+
+    @torch.no_grad()
+    def generate(self, src_tokens: torch.Tensor, max_length: int = 50, decoder_start_token_id: int = None, num_beams: int = 1, early_stopping: bool = True, length_penalty: float = 1.0):
+        # num_beams, early_stopping, length_penalty are common HuggingFace generate args,
+        # but this basic greedy version won't use them. They are included for signature compatibility.
+        self.eval() 
+        device = src_tokens.device
+        batch_size = src_tokens.size(0)
+
+        if decoder_start_token_id is None:
+            # Fallback, though it should be provided by the caller.
+            # MarianTokenizer's BOS is often its PAD token or a language code.
+            # Using self.pad_idx as a guess if nothing else is known.
+            effective_bos_token_id = self.pad_idx 
+            print(f"Warning: decoder_start_token_id not provided to generate, using self.pad_idx ({self.pad_idx}) as fallback BOS.")
+        else:
+            effective_bos_token_id = decoder_start_token_id
+
+        # 1. Encode the source tokens
+        # (Reusing logic from the forward pass for embedding and positional encoding)
+        src_embeddings = self.src_embedding(src_tokens) * self.embedding_scale
+        # Determine sequence length for positional encoding, capped by PE buffer size
+        src_seq_len_for_pe = min(src_tokens.size(1), self.positional_encoding.size(1))
+        
+        # Adjust src_embeddings if its sequence length is greater than positional_encoding's max length
+        current_src_seq_len = src_embeddings.size(1)
+        if current_src_seq_len > self.positional_encoding.size(1):
+            src_embeddings_adjusted = src_embeddings[:, :self.positional_encoding.size(1), :]
+        else:
+            src_embeddings_adjusted = src_embeddings
+
+        src_embeddings_final = src_embeddings_adjusted + self.positional_encoding[:, :src_embeddings_adjusted.size(1), :] # Use adjusted length for PE slicing
+        src_embeddings_final = self.dropout(src_embeddings_final)
+        encoder_output = self.encoder(src_embeddings_final)
+
+        # 2. Initialize decoder input with BOS token
+        tgt_tokens = torch.full((batch_size, 1), effective_bos_token_id, dtype=torch.long, device=device)
+
+        # 3. Autoregressive decoding loop
+        for _ in range(max_length - 1): 
+            tgt_embeddings = self.tgt_embedding(tgt_tokens) * self.embedding_scale
+            
+            # Determine sequence length for positional encoding, capped by PE buffer size
+            current_tgt_seq_len = tgt_embeddings.size(1)
+            if current_tgt_seq_len > self.positional_encoding.size(1):
+                tgt_embeddings_adjusted = tgt_embeddings[:, :self.positional_encoding.size(1), :]
+            else:
+                tgt_embeddings_adjusted = tgt_embeddings
+                
+            tgt_embeddings_final = tgt_embeddings_adjusted + self.positional_encoding[:, :tgt_embeddings_adjusted.size(1), :] # Use adjusted length for PE slicing
+            tgt_embeddings_final = self.dropout(tgt_embeddings_final)
+            
+            # Create source padding mask for the decoder's cross-attention
+            src_padding_mask = (src_tokens != self.pad_idx).float()
+
+            decoder_output_logits = self.decoder(tgt_embeddings_final, encoder_output, src_padding_mask=src_padding_mask)
+            
+            next_token_logits = decoder_output_logits[:, -1, :] 
+            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(1)
+            
+            tgt_tokens = torch.cat((tgt_tokens, next_token), dim=1)
+
+            # Optional: Stop if an EOS token is generated. Requires EOS token ID.
+            # eos_token_id = getattr(self, 'eos_token_id', None) # Define eos_token_id if needed
+            # if eos_token_id is not None and (next_token == eos_token_id).all():
+            #     break
+        
+        return tgt_tokens
+

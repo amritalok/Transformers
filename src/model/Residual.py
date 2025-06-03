@@ -28,20 +28,40 @@ class Residual(pl.LightningModule):
         self.norm = nn.LayerNorm(dimension)  # Layer normalization
         self.dropout = nn.Dropout(dropout)  # Dropout for regularization
     
-    def forward(self, *tensors:Tensor, **kwargs) -> Tensor:
+    def forward(self, x_for_residual: Tensor, *args_for_sublayer: Tensor, **kwargs_for_sublayer) -> Tensor:
         """
         Apply sublayer with residual connection and layer normalization.
         
         The implementation follows the formula: LayerNorm(x + Dropout(Sublayer(x)))
-        where x is the last tensor in the input tensors.
         
         Args:
-            *tensors: Input tensors to the sublayer. The last tensor is used for the residual connection.
-            **kwargs: Additional keyword arguments to pass to the sublayer (e.g., mask).
+            x_for_residual: The input tensor for the residual connection (the 'x' in "x + sublayer()").
+            *args_for_sublayer: Positional arguments to be passed to the sublayer.
+            **kwargs_for_sublayer: Keyword arguments to be passed to the sublayer (e.g., mask).
             
         Returns:
             Output tensor after applying sublayer, dropout, residual connection, and layer normalization
         """
-        # Apply sublayer to all input tensors with kwargs, apply dropout, add residual connection, and normalize
-        return self.norm(tensors[-1] + self.dropout(self.sublayer(*tensors, **kwargs)))
+        try:
+            # Apply sublayer with its specific arguments
+            sublayer_output = self.sublayer(*args_for_sublayer, **kwargs_for_sublayer)
+            
+            # Apply dropout, add residual connection (with x_for_residual), and normalize
+            # Ensure shapes match for the addition if necessary, though usually sublayer output matches query/input.
+            if x_for_residual.shape != sublayer_output.shape:
+                # This might indicate an issue elsewhere if shapes are not compatible for addition.
+                # For attention, output shape matches query shape. For FFN, output shape matches input shape.
+                # Handling mismatches here can be complex; ideally, they should match.
+                # For now, we'll assume they match or the sublayer handles it.
+                # A more robust solution might involve padding/truncating or specific error handling.
+                pass # Or add specific error logging/handling if shapes can mismatch
+
+            return self.norm(x_for_residual + self.dropout(sublayer_output))
+        except Exception as e:
+            # For debugging during development
+            print(f"Error in Residual forward: {e}")
+            print(f"  - x_for_residual shape: {x_for_residual.shape}")
+            print(f"  - args_for_sublayer shapes: {[t.shape for t in args_for_sublayer]}")
+            print(f"  - kwargs_for_sublayer: {kwargs_for_sublayer}")
+            raise
 
