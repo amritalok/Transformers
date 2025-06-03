@@ -371,6 +371,9 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Force evaluation at the end of every epoch regardless of CLI
+    training_args.evaluation_strategy = "epoch"
+
     # Ensure output_dir is set for checkpointing and logging
     if training_args.output_dir is None:
         training_args.output_dir = "./outputs" # Default output directory
