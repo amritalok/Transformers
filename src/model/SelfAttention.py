@@ -3,6 +3,7 @@ from torch import nn
 import pytorch_lightning as pl
 from torch import Tensor
 from utils.Helper import scaled_dot_product_attention
+from typing import Optional
 
 class AttentionHead(pl.LightningModule):
     """
@@ -30,7 +31,7 @@ class AttentionHead(pl.LightningModule):
         self.key_proj = nn.Linear(dim_model, dim_key, bias=False)
         self.value_proj = nn.Linear(dim_model, dim_value, bias=False)
     
-    def forward(self, query:Tensor, key:Tensor, value:Tensor, mask=None) -> Tensor:
+    def forward(self, query:Tensor, key:Tensor, value:Tensor, attn_mask: Optional[Tensor] = None, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Compute scaled dot-product attention for a single head.
         
@@ -55,8 +56,24 @@ class AttentionHead(pl.LightningModule):
         key_projected = self.key_proj(key)
         value_projected = self.value_proj(value)
         
+        # Combine attn_mask (e.g., causal) and key_padding_mask (actual padding)
+        # scaled_dot_product_attention expects a single mask where True means 'ignore'.
+        final_attn_mask = None
+        if attn_mask is not None and key_padding_mask is not None:
+            # attn_mask is typically [tgt_len, src_len] or [1, src_len] for self-attention with causal
+            # key_padding_mask is typically [batch_size, src_len]
+            # We need to make them broadcastable to [batch_size, tgt_len, src_len]
+            # Expand key_padding_mask to [batch_size, 1, src_len] to broadcast across query positions
+            expanded_kpm = key_padding_mask.unsqueeze(1)
+            final_attn_mask = attn_mask | expanded_kpm
+        elif attn_mask is not None:
+            final_attn_mask = attn_mask
+        elif key_padding_mask is not None:
+            # Expand key_padding_mask to [batch_size, 1, src_len] to broadcast across query positions
+            final_attn_mask = key_padding_mask.unsqueeze(1)
+
         # Compute scaled dot-product attention
-        return scaled_dot_product_attention(query_projected, key_projected, value_projected, mask=mask)
+        return scaled_dot_product_attention(query_projected, key_projected, value_projected, attn_mask=final_attn_mask)
     
 
 

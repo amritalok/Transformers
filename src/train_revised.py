@@ -14,7 +14,7 @@ import torch
 import numpy as np
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Optional, Dict, Optional
 
 # Hugging Face imports
 import evaluate

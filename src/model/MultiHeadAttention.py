@@ -3,6 +3,7 @@ from torch import nn
 import pytorch_lightning as pl
 from torch import Tensor
 from model.SelfAttention import AttentionHead
+from typing import Optional
 
 class MultiHeadAttention(pl.LightningModule):
     """
@@ -35,7 +36,7 @@ class MultiHeadAttention(pl.LightningModule):
         # Linear projection to combine outputs from all heads
         self.linear = nn.Linear(num_heads * dim_v, dim_embedding)
     
-    def forward(self, query, key, value, mask=None) -> Tensor:
+    def forward(self, query, key, value, attn_mask: Optional[Tensor] = None, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Compute multi-head attention.
         
@@ -56,7 +57,7 @@ class MultiHeadAttention(pl.LightningModule):
         """
         # Apply each attention head and concatenate results
         # Each head projects to dim_v, so concatenating gives num_heads * dim_v
-        head_outputs = [head(query, key, value, mask=mask) for head in self.heads]
+        head_outputs = [head(query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask) for head in self.heads]
         concatenated = torch.cat(head_outputs, dim=-1)
         
         # Apply final linear projection

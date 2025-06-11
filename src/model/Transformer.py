@@ -5,6 +5,8 @@ import pytorch_lightning as pl
 from torch import Tensor
 from model.Encoder import Encoder
 from model.Decoder import Decoder
+from utils.Helper import create_look_ahead_mask # For _generate_square_subsequent_mask
+from typing import Optional
 
 class Transformer(pl.LightningModule):
     """
@@ -91,6 +93,12 @@ class Transformer(pl.LightningModule):
         
         # Loss function that ignores padding tokens
         self.criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+
+    def _generate_square_subsequent_mask(self, sz: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        """Generates a square causal mask for attending to previous positions."""
+        # Uses the updated create_look_ahead_mask from utils.Helper
+        # Returns a mask where True means "do not attend"
+        return create_look_ahead_mask(sz, device=device)
         
     def _create_positional_encoding(self, max_seq_length, dim_embedding):
         """
@@ -119,67 +127,74 @@ class Transformer(pl.LightningModule):
         # Add batch dimension and return
         return pos_encoding.unsqueeze(0)
 
-    def forward(self, src_tokens:Tensor, tgt_tokens:Tensor) -> Tensor:
+    def forward(self, src_tokens: Tensor, tgt_tokens_input: Tensor) -> Tensor:
         """
-        Process source and target sequences through the Transformer.
+        Process source and target sequences through the Transformer for training/evaluation.
         
         Args:
             src_tokens: Source token IDs of shape [batch_size, src_seq_len]
-            tgt_tokens: Target token IDs of shape [batch_size, tgt_seq_len]
+            tgt_tokens_input: Target token IDs for teacher forcing (shifted right), 
+                              shape [batch_size, tgt_seq_len]
             
         Returns:
-            Output tensor of shape [batch_size, tgt_seq_len, tgt_vocab_size] with probabilities
-            after softmax activation
+            Output logits tensor of shape [batch_size, tgt_seq_len, tgt_vocab_size]
         """
-        # Get sequence lengths and batch size
-        batch_size = src_tokens.size(0)
+        # Get sequence lengths
         src_seq_len = src_tokens.size(1)
-        tgt_seq_len = tgt_tokens.size(1)
-        
-        # Create padding mask for source sequence (1 for tokens, 0 for padding)
-        # This will be used to mask out padding tokens in attention
-        src_padding_mask = (src_tokens != self.pad_idx).float()  # Shape: [batch_size, src_seq_len]
-        
+        tgt_seq_len = tgt_tokens_input.size(1)
+        device = src_tokens.device
+
+        # 1. Create source key padding mask (True for padding tokens, False otherwise)
+        # Shape: [batch_size, src_seq_len]
+        src_key_padding_mask = (src_tokens == self.pad_idx)
+
+        # 2. Create target key padding mask (for decoder self-attention)
+        # True for padding tokens in the target input, False otherwise.
+        # Shape: [batch_size, tgt_seq_len]
+        tgt_key_padding_mask = (tgt_tokens_input == self.pad_idx)
+
+        # 3. Create target causal mask (for decoder self-attention)
+        # This prevents attending to future tokens in the target sequence.
+        # Shape: [tgt_seq_len, tgt_seq_len]
+        # Ensure it's on the same device as inputs.
+        tgt_causal_mask = self._generate_square_subsequent_mask(tgt_seq_len, device=device)
+
         # Convert token IDs to embeddings and scale
         src_embeddings = self.src_embedding(src_tokens) * self.embedding_scale
-        tgt_embeddings = self.tgt_embedding(tgt_tokens) * self.embedding_scale
-        
-        # Add positional encoding, handling possible sequence length differences
-        max_pos_len = self.positional_encoding.size(1)
-        
-        # Ensure we don't exceed the pre-computed positional encoding length
-        src_seq_len_capped = min(src_seq_len, max_pos_len)
-        tgt_seq_len_capped = min(tgt_seq_len, max_pos_len)
-        
-        # If source sequence is too long, truncate it for positional encoding
-        if src_seq_len > max_pos_len:
-            print(f"Warning: Source sequence length {src_seq_len} exceeds maximum positional encoding length {max_pos_len}")
-            src_embeddings = src_embeddings[:, :max_pos_len, :]
-            src_padding_mask = src_padding_mask[:, :max_pos_len]
-            src_seq_len = max_pos_len
-        
-        # If target sequence is too long, truncate it for positional encoding
-        if tgt_seq_len > max_pos_len:
-            print(f"Warning: Target sequence length {tgt_seq_len} exceeds maximum positional encoding length {max_pos_len}")
-            tgt_embeddings = tgt_embeddings[:, :max_pos_len, :]
-            tgt_tokens = tgt_tokens[:, :max_pos_len]
-            tgt_seq_len = max_pos_len
+        tgt_embeddings = self.tgt_embedding(tgt_tokens_input) * self.embedding_scale
         
         # Add positional encoding
-        src_embeddings = src_embeddings + self.positional_encoding[:, :src_seq_len, :]
-        tgt_embeddings = tgt_embeddings + self.positional_encoding[:, :tgt_seq_len, :]
+        # Ensure we don't exceed the pre-computed positional encoding length
+        max_pos_len = self.positional_encoding.size(1)
+        src_len_for_pe = min(src_seq_len, max_pos_len)
+        tgt_len_for_pe = min(tgt_seq_len, max_pos_len)
+
+        # Apply positional encoding (slicing PE to match input seq len if input is shorter)
+        src_embeddings = src_embeddings[:, :src_len_for_pe, :] + self.positional_encoding[:, :src_len_for_pe, :]
+        tgt_embeddings = tgt_embeddings[:, :tgt_len_for_pe, :] + self.positional_encoding[:, :tgt_len_for_pe, :]
         
         # Apply dropout
         src_embeddings = self.dropout(src_embeddings)
         tgt_embeddings = self.dropout(tgt_embeddings)
         
-        # First encode the source sequence
-        encoder_output = self.encoder(src_embeddings)
+        # Encode source tokens, passing the source key padding mask
+        encoder_output = self.encoder(src_embeddings, src_key_padding_mask=src_key_padding_mask)
         
-        # Then decode using the encoded source and target embeddings
-        # Pass the source padding mask to handle different sequence lengths
-        return self.decoder(tgt_embeddings, encoder_output, src_padding_mask)
-    
+        # Decode target tokens using encoder output
+        # Pass appropriate masks to the decoder:
+        # - tgt_causal_mask: for causal self-attention in decoder
+        # - tgt_key_padding_mask: for padding in target sequence in decoder self-attention
+        # - memory_key_padding_mask (src_key_padding_mask): for padding in source sequence in decoder cross-attention
+        decoder_output_logits = self.decoder(
+            tgt_embeddings, 
+            encoder_output, 
+            tgt_mask=tgt_causal_mask, 
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask
+        )
+        
+        return decoder_output_logits # Return raw logits
+
     def training_step(self, batch, batch_idx):
         """
         Perform a single training step.
@@ -198,9 +213,12 @@ class Transformer(pl.LightningModule):
         # tgt_tokens_target is the actual target sequence to predict
         outputs = self(src_tokens, tgt_tokens_input)
         
-        # Reshape predictions and targets for loss calculation
-        # from [batch_size, seq_len, vocab_size] to [batch_size * seq_len, vocab_size]
-        loss = self.criterion(outputs.view(-1, outputs.size(-1)), tgt_tokens_target.view(-1))
+        # Calculate loss (CrossEntropyLoss expects raw logits)
+        # Reshape for CrossEntropyLoss: [batch_size * tgt_seq_len, tgt_vocab_size]
+        loss = self.criterion(
+            outputs.view(-1, outputs.size(-1)), 
+            tgt_tokens_target.view(-1)
+        )
         
         # Log the training loss
         self.log('train_loss', loss, prog_bar=True)
@@ -256,7 +274,12 @@ class Transformer(pl.LightningModule):
 
         src_embeddings_final = src_embeddings_adjusted + self.positional_encoding[:, :src_embeddings_adjusted.size(1), :] # Use adjusted length for PE slicing
         src_embeddings_final = self.dropout(src_embeddings_final)
-        encoder_output = self.encoder(src_embeddings_final)
+
+        # Create source key padding mask for encoder and cross-attention in decoder
+        # True for padding tokens, False otherwise. Shape: [batch_size, src_seq_len]
+        current_src_key_padding_mask = (src_tokens == self.pad_idx)
+
+        encoder_output = self.encoder(src_embeddings_final, src_key_padding_mask=current_src_key_padding_mask)
 
         # 2. Initialize decoder input with BOS token
         tgt_tokens = torch.full((batch_size, 1), effective_bos_token_id, dtype=torch.long, device=device)
@@ -275,10 +298,19 @@ class Transformer(pl.LightningModule):
             tgt_embeddings_final = tgt_embeddings_adjusted + self.positional_encoding[:, :tgt_embeddings_adjusted.size(1), :] # Use adjusted length for PE slicing
             tgt_embeddings_final = self.dropout(tgt_embeddings_final)
             
-            # Create source padding mask for the decoder's cross-attention
-            src_padding_mask = (src_tokens != self.pad_idx).float()
+            # Create target causal mask for decoder's self-attention
+            # Shape: [current_tgt_seq_len, current_tgt_seq_len]
+            current_tgt_causal_mask = self._generate_square_subsequent_mask(tgt_tokens.size(1), device=device)
 
-            decoder_output_logits = self.decoder(tgt_embeddings_final, encoder_output, src_padding_mask=src_padding_mask)
+            # Decoder call for generation. 
+            # No target padding to worry about in `tgt_tokens` during generation as it's built token by token.
+            # `memory_key_padding_mask` is `current_src_key_padding_mask` from encoder step.
+            decoder_output_logits = self.decoder(
+                tgt_embeddings_final, 
+                encoder_output, 
+                tgt_mask=current_tgt_causal_mask, # For self-attention causality
+                memory_key_padding_mask=current_src_key_padding_mask # For cross-attention padding
+            )
             
             next_token_logits = decoder_output_logits[:, -1, :] 
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(1)

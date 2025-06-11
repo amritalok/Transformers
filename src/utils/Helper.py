@@ -35,7 +35,7 @@ class Config(dict):
     def __repr__(self):
         return f"Config({super().__repr__()})"
 
-def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
     """
     Compute scaled dot-product attention as described in 'Attention is All You Need'.
     This implementation handles attention between sequences of different lengths.
@@ -64,27 +64,28 @@ def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask
     # Print tensor dimensions for debugging
     # print(f"Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
     
-    # Handle masks with incompatible shapes
-    # If mask is provided, make sure it has the right shape [batch_size, seq_len_q, seq_len_k]
-    if mask is not None:
-        # If mask is 2D, expand to 3D
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # If mask doesn't match the expected dimensions, create a new compatible mask
-        # This is critical for cross-attention between sequences of different lengths
-        if mask.size(1) != seq_len_q or mask.size(2) != seq_len_k:
-            # print(f"Warning: Mask shape {mask.shape} doesn't match expected shape [{batch_size}, {seq_len_q}, {seq_len_k}]")
-            mask = torch.ones(batch_size, seq_len_q, seq_len_k, device=query.device)
-    
     # Compute attention scores: batch_matmul(Q, K^T) / sqrt(d_k)
     # Shape: [batch_size, seq_len_q, seq_len_k]
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(dim_k)
     
-    # Apply mask (if provided) by setting masked positions to a large negative value
-    # Use -65500 instead of -1e9 for FP16 compatibility (FP16 range is approximately ±65504)
-    if mask is not None:
-        scores = scores.masked_fill(mask == 0, -65500.0)
+    # Apply attention mask (if provided)
+    # attn_mask should be boolean, where True indicates a position that should NOT be attended to.
+    if attn_mask is not None:
+        if attn_mask.dtype != torch.bool:
+            # Assuming 0 means ignore if not boolean (for backward compatibility with old float masks if any)
+            # However, boolean masks are strongly preferred.
+            print(f"Warning: attn_mask in scaled_dot_product_attention is not boolean (dtype: {attn_mask.dtype}). Assuming 0 means ignore.")
+            scores = scores.masked_fill(attn_mask == 0, -float('inf'))
+        else:
+            scores = scores.masked_fill(attn_mask, -float('inf'))
+        
+        # Ensure the mask has the correct shape for broadcasting or direct application.
+        # Expected shapes for attn_mask: 
+        #   - [batch_size, seq_len_q, seq_len_k] (for batch-specific padding masks combined with causal)
+        #   - [seq_len_q, seq_len_k] (for causal mask, will broadcast across batch)
+        #   - [batch_size, 1, seq_len_k] (for key_padding_mask, will broadcast across query_len)
+        # The `masked_fill` handles broadcasting if dimensions are compatible (e.g., [L,S] mask for [B,H,L,S] scores in nn.MHA)
+        # Here, scores are [B, L, S], so mask should be [B,L,S] or [L,S] or [B,1,S] or [B,L,1]
 
     # Apply softmax to get attention weights
     # Shape: [batch_size, seq_len_q, seq_len_k]
@@ -97,7 +98,7 @@ def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, mask
     return output
 
 
-def create_look_ahead_mask(size: int, device: torch.device = torch.device('cpu')) -> Tensor:
+def create_look_ahead_mask(size: int, device: Optional[torch.device] = None) -> Tensor:
     """
     Create a look-ahead mask to prevent positions from attending to subsequent positions.
     
@@ -111,12 +112,10 @@ def create_look_ahead_mask(size: int, device: torch.device = torch.device('cpu')
     Returns:
         Mask tensor of shape [size, size] where 1 means attend, 0 means don't attend
     """
-    # Create a matrix where the lower triangle (including diagonal) is 1 and upper triangle is 0
-    # Shape: [size, size]
-    mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).bool()
-    
-    # Invert the mask: 1 means attend, 0 means don't attend
-    return ~mask
+    # Create a square matrix with True in the upper triangle (positions to be masked).
+    # True means the position should NOT be attended to.
+    mask = torch.triu(torch.ones(size, size, dtype=torch.bool, device=device), diagonal=1)
+    return mask
 
 
 def feed_forward(dim_embedding: int = 512, dim_feedforward: int = 2048) -> nn.Module:

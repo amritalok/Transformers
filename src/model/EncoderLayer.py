@@ -5,6 +5,7 @@ from torch import Tensor
 from utils.Helper import feed_forward
 from model.MultiHeadAttention import MultiHeadAttention
 from model.Residual import Residual
+from typing import Optional
 
 class EncoderLayer(pl.LightningModule):
     """
@@ -52,7 +53,7 @@ class EncoderLayer(pl.LightningModule):
             dropout = dropout
         )
     
-    def forward(self, x: Tensor, src_padding_mask: Tensor = None) -> Tensor:
+    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Process input through the encoder layer.
         
@@ -71,7 +72,15 @@ class EncoderLayer(pl.LightningModule):
         # Self-attention mechanism
         # self.attention is Residual(MHA_self_encoder)
         # Pass x for residual, then x,x,x for MHA's q,k,v, then mask.
-        attention_output = self.attention(x, x, x, x, mask=src_padding_mask)
+        attention_output = self.attention(
+            x,  # Input 'x' for the Residual connection
+            # Arguments for the MultiHeadAttention sublayer:
+            x,  # query
+            x,  # key
+            x,  # value
+            attn_mask=None, # Encoder self-attention typically doesn't have a structural/causal mask
+            key_padding_mask=src_key_padding_mask # Pass the source key padding mask
+        )
         
         # Position-wise feed-forward network
         # self.feed_forward is Residual(FeedForwardNetwork)

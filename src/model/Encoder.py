@@ -3,6 +3,7 @@ from torch import nn
 import pytorch_lightning as pl
 from torch import Tensor
 from model.EncoderLayer import EncoderLayer
+from typing import Optional
 
 class Encoder(pl.LightningModule):
     """
@@ -40,7 +41,7 @@ class Encoder(pl.LightningModule):
             EncoderLayer(dim_embedding, num_heads, dim_feedfordward, dropout) for _ in range(num_layers) 
         ])
     
-    def forward(self, x:Tensor) -> Tensor:
+    def forward(self, x: Tensor, src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Process input sequence through the encoder stack.
         
@@ -56,6 +57,6 @@ class Encoder(pl.LightningModule):
         # Process through each encoder layer
         encoder_output = x
         for layer in self.layers:
-            encoder_output = layer(encoder_output)
+            encoder_output = layer(encoder_output, src_key_padding_mask=src_key_padding_mask)
             
         return encoder_output

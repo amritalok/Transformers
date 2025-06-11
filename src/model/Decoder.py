@@ -3,6 +3,7 @@ from torch import nn
 import pytorch_lightning as pl
 from torch import Tensor
 from model.DecoderLayer import DecoderLayer
+from typing import Optional
 
 class Decoder(pl.LightningModule):
     """
@@ -49,7 +50,13 @@ class Decoder(pl.LightningModule):
         self.linear = nn.Linear(dim_embedding, self.output_dim)
     
 
-    def forward(self, x:Tensor, encoder_output:Tensor, src_padding_mask=None) -> Tensor:
+    def forward(self, 
+                tgt_embed: Tensor, 
+                memory: Tensor, 
+                tgt_mask: Optional[Tensor] = None, 
+                memory_key_padding_mask: Optional[Tensor] = None, 
+                tgt_key_padding_mask: Optional[Tensor] = None
+            ) -> Tensor:
         """
         Process target sequence and encoder output through the decoder.
         
@@ -68,11 +75,21 @@ class Decoder(pl.LightningModule):
             after softmax activation
         """
         # Process through each decoder layer
-        decoder_output = x
+        # x is the target embeddings (tgt_embed)
+        # memory is the encoder_output
+        # tgt_mask is the causal mask for self-attention
+        # memory_key_padding_mask is the padding mask for the encoder output (source padding)
+        # tgt_key_padding_mask is the padding mask for the target sequence itself
+        current_input = tgt_embed
         for layer in self.layers:
-            # Pass the src_padding_mask to each decoder layer
-            decoder_output = layer(decoder_output, encoder_output, src_padding_mask)
+            current_input = layer(
+                current_input,  # target input to the layer
+                memory,  # encoder output (memory)
+                tgt_self_attn_mask=tgt_mask, # causal mask for self-attention
+                tgt_key_padding_mask=tgt_key_padding_mask, # target padding for self-attention
+                memory_key_padding_mask=memory_key_padding_mask # source padding for cross-attention
+            )
         
-        # Final linear projection and softmax
-        logits = self.linear(decoder_output)
-        return torch.softmax(logits, dim=-1)
+        # Final linear projection (decoder_output is now current_input)
+        logits = self.linear(current_input)
+        return logits # Return raw logits
